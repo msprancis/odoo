@@ -11,10 +11,8 @@ from psycopg2 import OperationalError
 import math
 import re
 from textwrap import shorten
-from unittest.mock import patch
 
 from odoo import api, fields, models, _, Command
-from odoo.addons.base.models.decimal_precision import DecimalPrecision
 from odoo.addons.account.tools import format_structured_reference_iso
 from odoo.exceptions import UserError, ValidationError, AccessError, RedirectWarning
 from odoo.tools import (
@@ -97,7 +95,12 @@ class AccountMove(models.Model):
         tracking=True,
         index='trigram',
     )
-    ref = fields.Char(string='Reference', copy=False, tracking=True)
+    ref = fields.Char(
+        string='Reference',
+        copy=False,
+        tracking=True,
+        index='trigram',
+    )
     date = fields.Date(
         string='Date',
         index=True,
@@ -292,6 +295,7 @@ class AccountMove(models.Model):
         comodel_name='account.payment.term',
         string='Payment Terms',
         compute='_compute_invoice_payment_term_id', store=True, readonly=False, precompute=True,
+        inverse='_inverse_invoice_payment_term_id',
         check_company=True,
     )
     needed_terms = fields.Binary(compute='_compute_needed_terms', exportable=False)
@@ -1192,7 +1196,7 @@ class AccountMove(models.Model):
                     reconciled_vals.append({
                         'name': counterpart_line.name,
                         'journal_name': counterpart_line.journal_id.name,
-                        'company_name': counterpart_line.journal_id.company_id.name if counterpart_line.journal_id.company_id != move.company_id else None,
+                        'company_name': counterpart_line.journal_id.company_id.name if counterpart_line.journal_id.company_id != move.company_id else False,
                         'amount': reconciled_partial['amount'],
                         'currency_id': move.company_id.currency_id.id if reconciled_partial['is_exchange'] else reconciled_partial['currency'].id,
                         'date': counterpart_line.date,
@@ -1703,9 +1707,16 @@ class AccountMove(models.Model):
             or m.journal_id.currency_id and m.currency_id != m.journal_id.currency_id
         ))
 
+    @api.onchange('payment_reference')
     def _inverse_payment_reference(self):
         self.line_ids._conditional_add_to_compute('name', lambda line: (
             line.display_type == 'payment_term'
+        ))
+
+    @api.onchange('invoice_payment_term_id')
+    def _inverse_invoice_payment_term_id(self):
+        self.line_ids._conditional_add_to_compute('name', lambda l: (
+            l.display_type == 'payment_term'
         ))
 
     def _inverse_name(self):
@@ -2205,6 +2216,9 @@ class AccountMove(models.Model):
             dirty_recs = eligible_recs.filtered(dirty_fname)
             return dirty_recs, dirty_fname
 
+        def filter_trivial(mapping):
+            return {k: v for k, v in mapping.items() if 'id' not in k}
+
         existing_before = existing()
         needed_before = needed()
         dirty_recs_before, dirty_fname = dirty()
@@ -2230,7 +2244,9 @@ class AccountMove(models.Model):
         }
 
         if needed_after == needed_before:
-            return
+            return  # do not modify user input if nothing changed in the needs
+        if not needed_before and (filter_trivial(existing_after) != filter_trivial(existing_before)):
+            return  # do not modify user input if already created manually
 
         to_delete = [
             line.id
@@ -3065,12 +3081,7 @@ class AccountMove(models.Model):
         The reasonning is that if the document that we are importing has a discount, it
         shouldn't be rounded to the local settings.
         """
-        original_precision_get = DecimalPrecision.precision_get
-        def precision_get(self, application):
-            if application == 'Discount':
-                return 100
-            return original_precision_get(self, application)
-        with patch('odoo.addons.base.models.decimal_precision.DecimalPrecision.precision_get', new=precision_get):
+        with self._disable_recursion({'records': self}, 'ignore_discount_precision'):
             yield
 
     def _get_edi_decoder(self, file_data, new=False):
@@ -4227,6 +4238,24 @@ class AccountMove(models.Model):
         """ Handle Send & Print async processing.
         :param job_count: maximum number of jobs to process if specified.
         """
+        def get_account_notification(partner, moves, is_success):
+            return [
+                partner,
+                'account_notification',
+                {
+                    'type': 'success' if is_success else 'warning',
+                    'title': _('Invoices sent') if is_success else _('Invoices in error'),
+                    'message': _('Invoices sent successfully.') if is_success else _(
+                        "One or more invoices couldn't be processed."),
+                    'action_button': {
+                        'name': _('Open'),
+                        'action_name': _('Sent invoices') if is_success else _('Invoices in error'),
+                        'model': 'account.move',
+                        'res_ids': moves.ids,
+                    },
+                },
+            ]
+
         limit = job_count + 1
         to_process = self.env['account.move']._read_group(
             [('send_and_print_values', '!=', False)],
@@ -4250,7 +4279,27 @@ class AccountMove(models.Model):
                 else:
                     raise
 
+            # Retrieve res.partner that executed the Send & Print wizard
+            sp_partner_ids = set(moves.mapped(lambda move: move.send_and_print_values.get('sp_partner_id')))
+            sp_partners = self.env['res.partner'].browse(sp_partner_ids)
+            moves_map = {
+                partner: moves.filtered(lambda m: m.send_and_print_values['sp_partner_id'] == partner.id)
+                for partner in sp_partners
+            }
+
             self.env['account.move.send']._process_send_and_print(moves)
+
+            notifications = []
+            for partner, partner_moves in moves_map.items():
+                partner_moves_error = partner_moves.filtered(lambda m: m.send_and_print_values and m.send_and_print_values.get('error'))
+                if partner_moves_error:
+                    notifications.append(get_account_notification(partner, partner_moves_error, False))
+                partner_moves_success = partner_moves - partner_moves_error
+                if partner_moves_success:
+                    notifications.append(get_account_notification(partner, partner_moves_success, True))
+                partner_moves_error.send_and_print_values = False
+
+            self.env['bus.bus']._sendmany(notifications)
 
         if need_retrigger:
             self.env.ref('account.ir_cron_account_move_send')._trigger()
@@ -4552,6 +4601,7 @@ class AccountMove(models.Model):
 
         disabled = container['records'].env.context.get(key, default) == target
         previous_values = {}
+        previous_envs = set(self.env.transaction.envs)
         if not disabled:  # it wasn't disabled yet, disable it now
             for env in self.env.transaction.envs:
                 previous_values[env] = env.context.get(key, EMPTY)
@@ -4563,6 +4613,9 @@ class AccountMove(models.Model):
                 if val != EMPTY:
                     env.context = frozendict({**env.context, key: val})
                 else:
+                    env.context = frozendict({k: v for k, v in env.context.items() if k != key})
+            for env in (self.env.transaction.envs - previous_envs):
+                if key in env.context:
                     env.context = frozendict({k: v for k, v in env.context.items() if k != key})
 
     # ------------------------------------------------------------

@@ -138,11 +138,11 @@ class HrExpense(models.Model):
         compute='_compute_total_amount', inverse='_inverse_total_amount', precompute=True, store=True, readonly=False,
         tracking=True,
     )
-    price_unit = fields.Monetary(
+    price_unit = fields.Float(
         string="Unit Price",
-        currency_field='company_currency_id',
         compute='_compute_price_unit', precompute=True, store=True, required=True, readonly=True,
         copy=True,
+        digits='Product Price',
     )
     currency_id = fields.Many2one(
         comodel_name='res.currency',
@@ -398,8 +398,13 @@ class HrExpense(models.Model):
            when edited after creation.
         """
         for expense in self:
-            if expense.product_id and expense.product_has_cost and not expense.nb_attachment:
-                expense.price_unit = expense.product_id._price_compute('standard_price', currency=expense.company_currency_id)[expense.product_id.id]
+            product_id = expense.product_id
+            if product_id and expense.product_has_cost and not expense.nb_attachment:
+                expense.price_unit = product_id._price_compute(
+                    'standard_price',
+                    uom=expense.product_uom_id,
+                    company=expense.company_id,
+                )[product_id.id]
             else:
                 expense.price_unit = expense.company_currency_id.round(expense.total_amount / expense.quantity) if expense.quantity else 0.
 
@@ -652,19 +657,28 @@ class HrExpense(models.Model):
 
         sheets = (own_expenses, company_expenses) if create_two_reports else (expenses_with_amount,)
         values = []
+
+        # We use a fallback name only when several expense sheets are created,
+        # else we use the form view required name to force the user to set a name
         for todo in sheets:
+            paid_by = 'company' if todo[0].payment_mode == 'company_account' else 'employee'
+            sheet_name = _("New Expense Report, paid by %(paid_by)s", paid_by=paid_by) if len(sheets) > 1 else False
             if len(todo) == 1:
-                expense_name = todo.name
+                sheet_name = todo.name
             else:
                 dates = todo.mapped('date')
-                min_date = format_date(self.env, min(dates))
-                max_date = format_date(self.env, max(dates))
-                expense_name = min_date if max_date == min_date else f'{min_date} - {max_date}'
+                if False not in dates:  # If at least one date isn't set, we don't set a default name
+                    min_date = format_date(self.env, min(dates))
+                    max_date = format_date(self.env, max(dates))
+                    if min_date == max_date:
+                        sheet_name = min_date
+                    else:
+                        sheet_name = _("%(date_from)s - %(date_to)s", date_from=min_date, date_to=max_date)
 
             values.append({
                 'company_id': self.company_id.id,
                 'employee_id': self[0].employee_id.id,
-                'name': expense_name,
+                'name': sheet_name,
                 'expense_line_ids': [Command.set(todo.ids)],
                 'state': 'draft',
             })
